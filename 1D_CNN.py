@@ -3,7 +3,6 @@
 # %%
 import os
 import json
-import time
 import random
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Optional
@@ -34,7 +33,11 @@ def set_seed(seed=RANDOM_SEED):
     torch.backends.cudnn.benchmark = False
 set_seed()
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = (
+    "mps" if torch.backends.mps.is_available()
+    else "cuda" if torch.cuda.is_available()
+    else "cpu"
+)
 
 # %%
 @dataclass
