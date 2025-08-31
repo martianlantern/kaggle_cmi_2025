@@ -28,7 +28,7 @@ set_seed()
 
 @dataclass
 class Config:
-    max_len: int = 400
+    max_len: int = 1000
     n_folds: int = 5
     imu_cols: Tuple[str, ...] = ("acc_x", "acc_y", "acc_z", "rot_w", "rot_x", "rot_y", "rot_z", "thm_1", "thm_2", "thm_3", "thm_4", "thm_5")
 
@@ -161,11 +161,15 @@ def run_cv_lightgbm():
             "objective": "multiclass",
             "num_class": len(le.classes_),
             "metric": "multi_logloss",
-            "learning_rate": 0.05,
-            "num_leaves": 63,
-            "feature_fraction": 0.9,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 5,
+            "learning_rate": 0.03,       # Lower LR allows more trees
+            "num_leaves": 127,           # More leaves = more complex trees
+            "max_depth": -1,             # No explicit depth limit (optional)
+            "feature_fraction": 0.8,     # Random feature subsample per tree
+            "bagging_fraction": 0.8,     # Random row subsample per tree
+            "bagging_freq": 5,           # Apply bagging every 5 iterations
+            "min_data_in_leaf": 20,      # Avoid very small leaves
+            "lambda_l1": 0.1,            # L1 regularization
+            "lambda_l2": 0.1,            # L2 regularization
             "seed": RANDOM_SEED,
             "class_weight": "balanced",
         }

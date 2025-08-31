@@ -1,6 +1,6 @@
 {
   "cfg": {
-    "max_len": 400,
+    "max_len": 1000,
     "n_folds": 5,
     "imu_cols": [
       "acc_x",
