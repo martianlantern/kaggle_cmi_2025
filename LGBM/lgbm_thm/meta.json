@@ -1,0 +1,60 @@
+{
+  "cfg": {
+    "max_len": 1000,
+    "n_folds": 5,
+    "imu_cols": [
+      "acc_x",
+      "acc_y",
+      "acc_z",
+      "rot_w",
+      "rot_x",
+      "rot_y",
+      "rot_z",
+      "thm_1",
+      "thm_2",
+      "thm_3",
+      "thm_4",
+      "thm_5"
+    ]
+  },
+  "classes": [
+    "Above ear - pull hair",
+    "Cheek - pinch skin",
+    "Drink from bottle/cup",
+    "Eyebrow - pull hair",
+    "Eyelash - pull hair",
+    "Feel around in tray and pull out an object",
+    "Forehead - pull hairline",
+    "Forehead - scratch",
+    "Glasses on/off",
+    "Neck - pinch skin",
+    "Neck - scratch",
+    "Pinch knee/leg skin",
+    "Pull air toward your face",
+    "Scratch knee/leg skin",
+    "Text on phone",
+    "Wave hello",
+    "Write name in air",
+    "Write name on leg"
+  ],
+  "gesture_to_type": {
+    "Cheek - pinch skin": "Target",
+    "Forehead - pull hairline": "Target",
+    "Write name on leg": "Non-Target",
+    "Feel around in tray and pull out an object": "Non-Target",
+    "Neck - scratch": "Target",
+    "Neck - pinch skin": "Target",
+    "Eyelash - pull hair": "Target",
+    "Eyebrow - pull hair": "Target",
+    "Forehead - scratch": "Target",
+    "Above ear - pull hair": "Target",
+    "Wave hello": "Non-Target",
+    "Write name in air": "Non-Target",
+    "Text on phone": "Non-Target",
+    "Pull air toward your face": "Non-Target",
+    "Pinch knee/leg skin": "Non-Target",
+    "Scratch knee/leg skin": "Non-Target",
+    "Drink from bottle/cup": "Non-Target",
+    "Glasses on/off": "Non-Target"
+  }
+}

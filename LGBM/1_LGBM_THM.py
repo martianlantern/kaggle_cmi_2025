@@ -170,8 +170,7 @@ def run_cv_lightgbm():
             "min_data_in_leaf": 20,      # Avoid very small leaves
             "lambda_l1": 0.1,            # L1 regularization
             "lambda_l2": 0.1,            # L2 regularization
-            "seed": RANDOM_SEED,
-            "class_weight": "balanced",
+            "seed": RANDOM_SEED
         }
 
         model = lgb.train(

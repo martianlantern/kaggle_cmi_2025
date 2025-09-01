@@ -1,0 +1,211 @@
+# %% imports
+import os
+import json
+import random
+from dataclasses import dataclass, asdict
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+from sklearn.metrics import f1_score
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import StratifiedGroupKFold
+import lightgbm as lgb
+
+# %% config
+INPUT_DIR = "../kaggle_cmi_2025/data"
+OUTPUT_DIR = "./outputs_lgbm_feature"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+def set_seed(seed=RANDOM_SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+set_seed()
+
+@dataclass
+class Config:
+    max_len: int = 200
+    n_folds: int = 5
+    imu_cols: Tuple[str, ...] = ("acc_x", "acc_y", "acc_z",
+                                  "rot_w", "rot_x", "rot_y", "rot_z",
+                                  "thm_1", "thm_2", "thm_3", "thm_4", "thm_5")
+
+CFG = Config()
+
+# %% load data
+train_data = pd.read_csv(os.path.join(INPUT_DIR, "train.csv"))
+test_data  = pd.read_csv(os.path.join(INPUT_DIR, "test.csv"))
+
+present_cols = [c for c in CFG.imu_cols if c in train_data.columns]
+CFG.imu_cols = tuple(present_cols)
+
+# %% preprocessing utils
+def interpolate_fill_nan_safe(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    cols = [c for c in cols if c in out.columns]
+    out[cols] = out[cols].astype(np.float32)
+    out[cols] = out[cols].interpolate(method="linear", limit_direction="both", axis=0)
+    out[cols] = out[cols].ffill().bfill().fillna(0.0)
+    return out
+
+def resample_to_fixed_length(arr: np.ndarray, out_len: int) -> np.ndarray:
+    T, C = arr.shape
+    if T == out_len: return arr
+    if T <= 1:
+        base = np.zeros((out_len, C), dtype=np.float32)
+        if T == 1: base[:] = arr[0]
+        return base
+    x_old = np.linspace(0.0, 1.0, num=T, dtype=np.float32)
+    x_new = np.linspace(0.0, 1.0, num=out_len, dtype=np.float32)
+    out = np.empty((out_len, C), dtype=np.float32)
+    for c in range(C):
+        out[:, c] = np.interp(x_new, x_old, arr[:, c])
+    return out
+
+def zscore_per_sequence(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    m = np.nanmean(x, axis=0)
+    s = np.nanstd(x, axis=0)
+    m = np.where(np.isnan(m), 0.0, m)
+    s = np.where(np.isnan(s) | (s < eps), 1.0, s)
+    return (x - m) / s
+
+def competition_metric(y_true_idx, y_pred_idx, idx_to_class, gesture_to_type):
+    macro_f1 = f1_score(y_true_idx, y_pred_idx, average="macro", zero_division=0)
+    y_true_type = np.array([1 if gesture_to_type[idx_to_class[t]]=="Target" else 0 for t in y_true_idx])
+    y_pred_type = np.array([1 if gesture_to_type[idx_to_class[p]]=="Target" else 0 for p in y_pred_idx])
+    bin_f1 = f1_score(y_true_type, y_pred_type, average="binary", zero_division=0)
+    return {"macro_f1": macro_f1, "binary_f1": bin_f1, "mean_f1": (macro_f1+bin_f1)/2.0}
+
+# %% sequence info
+def build_sequence_table(df: pd.DataFrame) -> pd.DataFrame:
+    gb = df.groupby("sequence_id", sort=False)
+    info = gb.agg(subject=("subject","first"), n_rows=("row_id","count")).reset_index()
+    return info
+
+train_seq = build_sequence_table(train_data)
+test_seq  = build_sequence_table(test_data)
+
+seq_labels = (
+    train_data.groupby("sequence_id", sort=False)
+    .agg(gesture=("gesture","first"), sequence_type=("sequence_type","first"))
+    .reset_index()
+)
+train_seq = train_seq.merge(seq_labels, on="sequence_id", how="left")
+
+le = LabelEncoder()
+train_seq["gesture_idx"] = le.fit_transform(train_seq["gesture"].astype(str))
+idx_to_class = list(le.inverse_transform(np.arange(len(le.classes_))))
+gesture_to_type = (
+    train_seq.drop_duplicates("gesture")[["gesture","sequence_type"]]
+    .set_index("gesture")["sequence_type"].to_dict()
+)
+
+# %% feature engineering
+def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    # accelerometer magnitude
+    if set(["acc_x","acc_y","acc_z"]).issubset(df.columns):
+        df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
+        df['acc_mag_jerk'] = df.groupby('sequence_id')['acc_mag'].diff().fillna(0)
+
+    # rotation angle from quaternion
+    if set(["rot_w","rot_x","rot_y","rot_z"]).issubset(df.columns):
+        df['rot_angle'] = 2 * np.arccos(df['rot_w'].clip(-1,1))
+        df['rot_angle_vel'] = df.groupby('sequence_id')['rot_angle'].diff().fillna(0)
+
+    # thermal features
+    thm_cols = [c for c in df.columns if c.startswith("thm_")]
+    if thm_cols:
+        df['thm_mean'] = df[thm_cols].mean(axis=1)
+        df['thm_std']  = df[thm_cols].std(axis=1)
+        df['thm_min']  = df[thm_cols].min(axis=1)
+        df['thm_max']  = df[thm_cols].max(axis=1)
+        df['thm_slope'] = df[thm_cols].apply(lambda row: np.gradient(row)[-1], axis=1)
+
+    return df
+
+# %% feature extraction table
+def extract_features_table(df: pd.DataFrame, seq_info: pd.DataFrame, imu_cols: Tuple[str,...], max_len: int):
+    X_feats, y = [], []
+    df = add_derived_features(df)
+    feat_cols = [c for c in df.columns if c in imu_cols or c in ['acc_mag','acc_mag_jerk','rot_angle','rot_angle_vel',
+                                                                 'thm_mean','thm_std','thm_min','thm_max','thm_slope']]
+    for _, row in tqdm(seq_info.iterrows(), total=len(seq_info)):
+        sid = row["sequence_id"]
+        seq_df = df[df["sequence_id"]==sid].sort_values("sequence_counter")
+        x = seq_df[feat_cols].astype(np.float32).values
+        x = resample_to_fixed_length(x, max_len)
+        x = zscore_per_sequence(x)
+        X_feats.append(x.flatten())   # flatten for LGBM
+        if "gesture_idx" in row:
+            y.append(row["gesture_idx"])
+    X_feats = np.stack(X_feats)
+    y = np.array(y) if len(y) else None
+    return X_feats, y
+
+# %% training
+def run_lgbm_cv():
+    X, y = extract_features_table(train_data, train_seq, CFG.imu_cols, CFG.max_len)
+    subjects = train_seq["subject"].astype(str).values
+    splitter = StratifiedGroupKFold(n_splits=CFG.n_folds, shuffle=True, random_state=RANDOM_SEED)
+
+    fold_models = []
+    oof_pred = np.full(len(y), -1)
+
+    for fold, (tr_idx, va_idx) in enumerate(splitter.split(X, y, groups=subjects), start=1):
+        X_tr, X_va = X[tr_idx], X[va_idx]
+        y_tr, y_va = y[tr_idx], y[va_idx]
+
+        train_set = lgb.Dataset(X_tr, label=y_tr)
+        val_set   = lgb.Dataset(X_va, label=y_va)
+
+        params = {
+            "objective":"multiclass",
+            "num_class":len(le.classes_),
+            "metric":"multi_logloss",
+            "learning_rate":0.03,
+            "num_leaves":127,
+            "feature_fraction":0.8,
+            "bagging_fraction":0.8,
+            "bagging_freq":5,
+            "min_data_in_leaf":20,
+            "lambda_l1":0.1,
+            "lambda_l2":0.1,
+            "seed":RANDOM_SEED
+        }
+
+        model = lgb.train(params, train_set, valid_sets=[val_set], num_boost_round=500,
+                          callbacks=[lgb.early_stopping(30), lgb.log_evaluation(50)])
+        fold_models.append(model)
+
+        pred_va = np.argmax(model.predict(X_va), axis=1)
+        oof_pred[va_idx] = pred_va
+
+        metrics = competition_metric(y_va, pred_va, idx_to_class, gesture_to_type)
+        print(f"Fold {fold} | macroF1={metrics['macro_f1']:.4f} | binF1={metrics['binary_f1']:.4f} | meanF1={metrics['mean_f1']:.4f}")
+
+        model.save_model(os.path.join(OUTPUT_DIR, f"fold{fold}.txt"))
+
+    meta = {"cfg":asdict(CFG),"classes":idx_to_class,"gesture_to_type":gesture_to_type}
+    with open(os.path.join(OUTPUT_DIR, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    return fold_models
+
+fold_models = run_lgbm_cv()
+
+# %% inference
+def predict_test(fold_models):
+    X_test, _ = extract_features_table(test_data, test_seq, CFG.imu_cols, CFG.max_len)
+    probs_list = [m.predict(X_test) for m in fold_models]
+    probs = np.mean(probs_list, axis=0)
+    preds = np.argmax(probs, axis=1)
+    labels = [idx_to_class[i] for i in preds]
+
+    sub = pd.DataFrame({"sequence_id": test_seq["sequence_id"], "gesture": labels})
+    sub_path = os.path.join(OUTPUT_DIR, "submission.csv")
+    sub.to_csv(sub_path, index=False)
+    print(f"Saved submission to {sub_path}")
+
+predict_test(fold_models)
