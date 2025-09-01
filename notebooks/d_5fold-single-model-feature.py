@@ -1,4 +1,14 @@
-# CV macroF1=0.4893 | binF1=0.9219 | meanF1=0.7056
+
+# TestConfig
+# CV macroF1=0.1759 | binF1=0.8565 | meanF1=0.5162
+
+
+# TestConfig (fold 5)
+# CV macroF1=0.2487 | binF1=0.8936 | meanF1=0.5711
+
+
+# Full Config 
+# CV macroF1=0.6105 | binF1=0.9604 | meanF1=0.7855
 
 # %%
 import os
@@ -208,7 +218,8 @@ def interpolate_fill_nan_safe(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame
     out = df.copy()
     # Work only on existing cols (defensive)
     cols = [c for c in cols if c in out.columns]
-    out[cols] = out[cols].astype(np.float32)
+    out[cols] = out[cols].astype(np.float32)\
+        
 
     # Linear interpolation and ffill/bfill
     out[cols] = out[cols].interpolate(method="linear", limit_direction="both", axis=0)

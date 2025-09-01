@@ -1,4 +1,5 @@
-# CV macroF1=0.4893 | binF1=0.9219 | meanF1=0.7056
+# TestConfig
+# CV macroF1=0.1759 | binF1=0.8565 | meanF1=0.5162
 
 # %%
 import os
@@ -19,11 +20,13 @@ from sklearn.model_selection import StratifiedGroupKFold
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from collections import defaultdict
 
 # %%
-INPUT_DIR = "./data"
-OUTPUT_DIR = "./outputs/v8"
+INPUT_DIR = "../data"
+OUTPUT_DIR = "../outputs/v8"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 RANDOM_SEED = 42
@@ -87,7 +90,7 @@ class TestConfig:
     use_all_sensors: bool = True  # Flag to enable multi-sensor fusion
     quick_test = True
 
-CFG = TestConfig()
+CFG = TestConfig()  # Use full training config for better performance
 
 # %%
 train_data = pd.read_csv(os.path.join(INPUT_DIR, "train.csv"))
@@ -286,29 +289,272 @@ class SequenceDataset(Dataset):
             return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long), 0
 
 # %%
-class CNN1D(nn.Module):
-    def __init__(self, in_ch: int, n_classes: int, dropout: float = 0.2):
+# Split-sensor multi-branch model components
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=8):
         super().__init__()
-        def block(c_in, c_out, k=5, s=1, p=2):
-            return nn.Sequential(
-                nn.Conv1d(c_in, c_out, kernel_size=k, stride=s, padding=p, bias=False),
-                nn.BatchNorm1d(c_out),
-                nn.ReLU(inplace=True),
-                nn.MaxPool1d(kernel_size=2)
-            )
-        self.net = nn.Sequential(
-            block(in_ch, 64),
-            block(64, 128),
-            block(128, 256, k=3, p=1),
-            nn.Dropout(dropout),
-        )
-        self.gap = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Linear(256, n_classes)
+        self.fc1 = nn.Linear(channels, channels // reduction, bias=True)
+        self.fc2 = nn.Linear(channels // reduction, channels, bias=True)
+        self.sigmoid = nn.Sigmoid()
 
+    def forward(self, x):
+        # x: (B, C, L)
+        se = F.adaptive_avg_pool1d(x, 1).squeeze(-1)      # -> (B, C)
+        se = F.relu(self.fc1(se), inplace=True)          # -> (B, C//r)
+        se = self.sigmoid(self.fc2(se)).unsqueeze(-1)    # -> (B, C, 1)
+        return x * se
+
+class ResNetSEBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, wd=1e-4):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels,
+                               kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = nn.Conv1d(out_channels, out_channels,
+                               kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        # SE
+        self.se = SEBlock(out_channels)
+        
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1,
+                          padding=0, bias=False),
+                nn.BatchNorm1d(out_channels)
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        identity = self.shortcut(x)              # (B, out, L)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)                       # (B, out, L)
+        out = out + identity
+        out = self.relu(out)
+        out = F.layer_norm(out, out.shape[1:])   # Add layer normalization
+        return out
+
+class AttentionLayer(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.score_fn = nn.Linear(feature_dim, 1, bias=True)
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        # x: (B, L, F)
+        score = torch.tanh(self.score_fn(x))     # (B, L, 1)
+        weights = self.softmax(score.squeeze(-1))# (B, L)
+        weights = weights.unsqueeze(-1)          # (B, L, 1)
+        context = x * weights                    # (B, L, F)
+        return context.sum(dim=1)                # (B, F)
+
+class GaussianNoise(nn.Module):
+    """Add Gaussian noise to input tensor"""
+    def __init__(self, stddev):
+        super().__init__()
+        self.stddev = stddev
+    
+    def forward(self, x):
+        if self.training:
+            noise = torch.randn_like(x) * self.stddev
+            return x + noise
+        return x
+
+class CMIBackbone(nn.Module):
+    def __init__(self, imu_dim, thm_dim, tof_dim, **kwargs):
+        super().__init__()
+        # Calculate split dimensions
+        imu_acc_dim = 3  # acc_x, acc_y, acc_z or linear_acc versions
+        imu_rot_dim = 4  # rot_w, rot_x, rot_y, rot_z
+        imu_other_dim = max(1, imu_dim - 7)  # remaining engineered features
+        
+        self.imu_acc_branch = nn.Sequential(
+            self.residual_feature_block(imu_acc_dim, kwargs["imu1_channels"], kwargs["imu1_layers"], drop=kwargs["imu1_dropout"]),
+            self.residual_feature_block(kwargs["imu1_channels"], kwargs["imu2_channels"], kwargs["imu2_layers"], drop=kwargs["imu2_dropout"])
+        )
+        self.imu_rot_branch = nn.Sequential(
+            self.residual_feature_block(imu_rot_dim, kwargs["imu1_channels"], kwargs["imu1_layers"], drop=kwargs["imu1_dropout"]),
+            self.residual_feature_block(kwargs["imu1_channels"], kwargs["imu2_channels"], kwargs["imu2_layers"], drop=kwargs["imu2_dropout"])
+        )
+        self.imu_other_branch = nn.Sequential(
+            self.residual_feature_block(imu_other_dim, kwargs["imu1_channels"], kwargs["imu1_layers"], drop=kwargs["imu1_dropout"]),
+            self.residual_feature_block(kwargs["imu1_channels"], kwargs["imu2_channels"], kwargs["imu2_layers"], drop=kwargs["imu2_dropout"])
+        )
+
+        # Each sensor gets its own branch
+        single_thm_dim = max(1, thm_dim // 5)  # thm_dim per sensor
+        single_tof_dim = max(1, tof_dim // 5)  # tof_dim per sensor
+        
+        self.thm_branch1, self.tof_branch1 = self.init_thm_tof_branch(single_thm_dim, single_tof_dim, **kwargs)
+        self.thm_branch2, self.tof_branch2 = self.init_thm_tof_branch(single_thm_dim, single_tof_dim, **kwargs)
+        self.thm_branch3, self.tof_branch3 = self.init_thm_tof_branch(single_thm_dim, single_tof_dim, **kwargs)
+        self.thm_branch4, self.tof_branch4 = self.init_thm_tof_branch(single_thm_dim, single_tof_dim, **kwargs)
+        self.thm_branch5, self.tof_branch5 = self.init_thm_tof_branch(single_thm_dim, single_tof_dim, **kwargs)
+
+        self.imu_proj = ResNetSEBlock(in_channels=3*kwargs["imu2_channels"], out_channels=kwargs["imu2_channels"])
+        self.thm_proj = ResNetSEBlock(in_channels=5*kwargs["thm2_channels"], out_channels=kwargs["thm2_channels"])
+        self.tof_proj = ResNetSEBlock(in_channels=5*kwargs["tof2_channels"], out_channels=kwargs["tof2_channels"])
+
+        self.lstm = nn.LSTM(
+            input_size=kwargs['imu2_channels']+kwargs['thm2_channels']+kwargs['tof2_channels'],
+            hidden_size=kwargs['lstm_hidden_size'],
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.gru = nn.GRU(
+            input_size=kwargs['imu2_channels']+kwargs['thm2_channels']+kwargs['tof2_channels'],
+            hidden_size=kwargs['gru_hidden_size'],
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+        
+        self.noise = GaussianNoise(kwargs['gaussian_noise_rate'])
+        self.dense = nn.Sequential(
+            nn.Linear(kwargs['imu2_channels']+kwargs['thm2_channels']+kwargs['tof2_channels'], kwargs['dense_channels']),
+            nn.ELU()
+        )
+        
+        self.attn = AttentionLayer(feature_dim=(kwargs['lstm_hidden_size']+kwargs['gru_hidden_size'])*2+kwargs['dense_channels'])
+
+    def feature_block(self, in_channels, out_channels, num_layers, pool_size=2, drop=0.3):
+        return nn.Sequential(
+            *[ResNetSEBlock(in_channels=in_channels, out_channels=in_channels) for i in range(num_layers)],
+            nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(pool_size, ceil_mode=True),
+            nn.Dropout(drop)
+        )
+
+    def residual_feature_block(self, in_channels, out_channels, num_layers, pool_size=2, drop=0.3):
+        return nn.Sequential(
+            *[ResNetSEBlock(in_channels=in_channels, out_channels=in_channels) for i in range(num_layers)],
+            ResNetSEBlock(in_channels, out_channels, wd=1e-4),
+            nn.MaxPool1d(pool_size, ceil_mode=True),
+            nn.Dropout(drop)
+        )
+
+    def init_thm_tof_branch(self, thm_dim, tof_dim, **kwargs):
+        thm_branch = nn.Sequential(
+            self.feature_block(thm_dim, kwargs["thm1_channels"], kwargs["thm1_layers"], drop=kwargs["thm1_dropout"]),
+            self.feature_block(kwargs["thm1_channels"], kwargs["thm2_channels"], kwargs["thm2_layers"], drop=kwargs["thm2_dropout"]),
+        )
+        tof_branch = nn.Sequential(
+            self.feature_block(tof_dim, kwargs["tof1_channels"], kwargs["tof1_layers"], drop=kwargs["tof1_dropout"]),
+            self.feature_block(kwargs["tof1_channels"], kwargs["tof2_channels"], kwargs["tof2_layers"], drop=kwargs["tof2_dropout"]),
+        )
+        return thm_branch, tof_branch
+    
+    def forward(self, x):
+        # x: (B, C, L) where C = imu_dim + thm_dim + tof_dim
+        B, C, L = x.shape
+        
+        # Split input based on sensor type (simplified approach)
+        # Assume first 7 channels are IMU, then THM, then TOF
+        imu_channels = 7  # or dynamic based on actual IMU features
+        thm_channels = 5  # CFG.thm_cols
+        
+        imu_data = x[:, :imu_channels, :]
+        thm_data = x[:, imu_channels:imu_channels+thm_channels, :]
+        tof_data = x[:, imu_channels+thm_channels:, :]
+        
+        # Split IMU into acc, rot, other (simplified)
+        imu_acc = imu_data[:, :3, :]  # First 3 channels
+        imu_rot = imu_data[:, 3:7, :]  # Next 4 channels  
+        imu_other = x[:, 7:imu_channels, :] if imu_channels > 7 else torch.zeros(B, 1, L, device=x.device)
+        
+        imu_acc_feat = self.imu_acc_branch(imu_acc)
+        imu_rot_feat = self.imu_rot_branch(imu_rot)
+        imu_other_feat = self.imu_other_branch(imu_other)
+        imu_feat = self.imu_proj(torch.cat([imu_acc_feat, imu_rot_feat, imu_other_feat], dim=1))
+        
+        # Process each THM/TOF sensor separately (simplified - each gets 1/5 of channels)
+        thm_feats, tof_feats = [], []
+        thm_per_sensor = max(1, thm_channels // 5)
+        tof_per_sensor = max(1, tof_data.size(1) // 5)
+        
+        for i in range(5):
+            # THM sensor i
+            thm_start = i * thm_per_sensor
+            thm_end = min((i + 1) * thm_per_sensor, thm_channels)
+            thm_sensor_data = thm_data[:, thm_start:thm_end, :] if thm_end > thm_start else torch.zeros(B, 1, L, device=x.device)
+            
+            # TOF sensor i  
+            tof_start = i * tof_per_sensor
+            tof_end = min((i + 1) * tof_per_sensor, tof_data.size(1))
+            tof_sensor_data = tof_data[:, tof_start:tof_end, :] if tof_end > tof_start else torch.zeros(B, 1, L, device=x.device)
+            
+            if i == 0:
+                thm_feat = self.thm_branch1(thm_sensor_data)
+                tof_feat = self.tof_branch1(tof_sensor_data)
+            elif i == 1:
+                thm_feat = self.thm_branch2(thm_sensor_data)
+                tof_feat = self.tof_branch2(tof_sensor_data)
+            elif i == 2:
+                thm_feat = self.thm_branch3(thm_sensor_data)
+                tof_feat = self.tof_branch3(tof_sensor_data)
+            elif i == 3:
+                thm_feat = self.thm_branch4(thm_sensor_data)
+                tof_feat = self.tof_branch4(tof_sensor_data)
+            else:
+                thm_feat = self.thm_branch5(thm_sensor_data)
+                tof_feat = self.tof_branch5(tof_sensor_data)
+                
+            thm_feats.append(thm_feat)
+            tof_feats.append(tof_feat)
+        
+        thm_feat = self.thm_proj(torch.cat(thm_feats, dim=1))
+        tof_feat = self.tof_proj(torch.cat(tof_feats, dim=1))
+        
+        feat = torch.cat([imu_feat, thm_feat, tof_feat], dim=1).permute(0, 2, 1)
+        lstm_out, _ = self.lstm(feat)
+        gru_out, _ = self.gru(feat)
+        dense_out = self.dense(self.noise(feat))
+        
+        return self.attn(torch.cat([lstm_out, gru_out, dense_out], dim=-1))
+
+class CMIModel(nn.Module):
+    def __init__(self, in_ch: int, n_classes: int, dropout: float = 0.2, **kwargs):
+        super().__init__()
+        # Calculate dimensions (simplified - will be refined later)
+        imu_dim = 7  # Base IMU channels 
+        thm_dim = 5  # Thermopile channels
+        tof_dim = max(1, in_ch - imu_dim - thm_dim)  # Remaining for ToF
+        
+        # Default model args if not provided
+        default_args = {
+            "imu1_channels": 128, "imu2_channels": 256, "imu1_dropout": 0.3, "imu2_dropout": 0.25,
+            "imu1_layers": 0, "imu2_layers": 0, 
+            "thm1_channels": 32, "thm2_channels": 64, "thm1_dropout": 0.25, "thm2_dropout": 0.2,
+            "thm1_layers": 0, "thm2_layers": 0, 
+            "tof1_channels": 64, "tof2_channels": 128, "tof1_dropout": 0.4, "tof2_dropout": 0.3,
+            "tof1_layers": 0, "tof2_layers": 0, 
+            "lstm_hidden_size": 128, "gru_hidden_size": 128, "gaussian_noise_rate": 0.1, "dense_channels": 32,
+            "cls_channels1": 256, "cls_dropout1": 0.2, "cls_channels2": 128, "cls_dropout2": 0.2,
+        }
+        default_args.update(kwargs)
+        
+        self.backbone = CMIBackbone(imu_dim, thm_dim, tof_dim, **default_args)
+        self.classifier = nn.Sequential(
+            nn.Linear((default_args['lstm_hidden_size']+default_args['gru_hidden_size'])*2+default_args['dense_channels'], default_args["cls_channels1"]),
+            nn.BatchNorm1d(default_args["cls_channels1"]),
+            nn.ReLU(),
+            nn.Dropout(default_args["cls_dropout1"]),
+            nn.Linear(default_args["cls_channels1"], default_args["cls_channels2"]),
+            nn.BatchNorm1d(default_args["cls_channels2"]),
+            nn.ReLU(),
+            nn.Dropout(default_args["cls_dropout2"]),
+            nn.Linear(default_args["cls_channels2"], n_classes)
+        )
+    
     def forward(self, x):  # x: (B, C, L)
-        x = self.net(x)
-        x = self.gap(x).squeeze(-1)
-        return self.head(x)
+        feat = self.backbone(x)
+        return self.classifier(feat)
 
 # %%
 def train_one_epoch(model, loader, optimizer, scheduler, criterion, desc: str):
@@ -391,7 +637,7 @@ def run_cv_and_train_full():
         tr_loader = DataLoader(tr_ds, batch_size=CFG.batch_size, shuffle=True,  num_workers=CFG.num_workers, pin_memory=True)
         va_loader = DataLoader(va_ds, batch_size=CFG.batch_size, shuffle=False, num_workers=CFG.num_workers, pin_memory=True)
 
-        model = CNN1D(in_ch=in_ch, n_classes=n_classes, dropout=CFG.dropout).to(DEVICE)
+        model = CMIModel(in_ch=in_ch, n_classes=n_classes, dropout=CFG.dropout).to(DEVICE)
         optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
         steps_per_epoch = max(1, len(tr_loader))
         scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=CFG.lr, epochs=CFG.n_epochs, steps_per_epoch=steps_per_epoch)
@@ -475,7 +721,7 @@ class InferenceEnsemble:
         self.device = device
         self.models = []
         for p in ckpt_paths:
-            m = CNN1D(in_ch, n_classes, dropout=dropout).to(device)
+            m = CMIModel(in_ch, n_classes, dropout=dropout).to(device)
             m.load_state_dict(torch.load(p, map_location=device))
             m.eval()
             self.models.append(m)

@@ -1,4 +1,5 @@
-# CV macroF1=0.4893 | binF1=0.9219 | meanF1=0.7056
+# TestConfig
+# CV macroF1=0.2003 | binF1=0.8451 | meanF1=0.5227
 
 # %%
 import os
@@ -25,8 +26,8 @@ from scipy.spatial.transform import Rotation as R
 from sklearn.preprocessing import StandardScaler
 
 # %%
-INPUT_DIR = "./data"
-OUTPUT_DIR = "./outputs/cmi-solution-v28"
+INPUT_DIR = "../data"
+OUTPUT_DIR = "../outputs/cmi-solution-v28"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 RANDOM_SEED = 42
