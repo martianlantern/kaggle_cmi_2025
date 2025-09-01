@@ -166,8 +166,7 @@ def run_cv_lightgbm():
             "feature_fraction": 0.9,
             "bagging_fraction": 0.8,
             "bagging_freq": 5,
-            "seed": RANDOM_SEED,
-            "class_weight": "balanced",
+            "seed": RANDOM_SEED
         }
 
         model = lgb.train(

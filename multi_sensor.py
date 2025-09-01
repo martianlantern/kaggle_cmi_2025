@@ -21,9 +21,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-# %%
-INPUT_DIR = "/home/ubuntu/cmi/kaggle_assets"
-OUTPUT_DIR = "/home/ubuntu/cmi/notebooks/v7/kaggle_cmi_2025-main"
+# %%  
+INPUT_DIR = "./kaggle_cmi_2025/data"
+OUTPUT_DIR = "./multi_data_result"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 RANDOM_SEED = 42
@@ -38,6 +38,8 @@ DEVICE = (
     else "cuda" if torch.cuda.is_available()
     else "cpu"
 )
+
+print(DEVICE)
 # %%
 import time
 start_time = time.time()
@@ -48,9 +50,9 @@ print(f"Script started at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st
 @dataclass
 class Config:
     max_len: int = 400
-    batch_size: int = 64
+    batch_size: int = 32
     num_workers: int = 8
-    n_folds: int = 5
+    n_folds: int = 3
     n_epochs: int = 12
     lr: float = 2e-3
     weight_decay: float = 1e-4
@@ -86,7 +88,7 @@ class TestConfig:
     kaggle: bool = False
     use_all_sensors: bool = True  # Flag to enable multi-sensor fusion
     quick_test = True
-CFG = TestConfig()
+CFG = Config()
 
 # %%
 train_data = pd.read_csv(os.path.join(INPUT_DIR, "train.csv"))
@@ -466,7 +468,7 @@ def run_cv_and_train_full():
     return fold_ckpts
 
 # %%
-fold_ckpts = run_cv_and_train_full()
+# fold_ckpts = run_cv_and_train_full()
 
 # %%
 class InferenceEnsemble:
@@ -561,7 +563,7 @@ def predict_test_and_save_csv():
     sub.to_csv(sub_path, index=False)
     print(f"Saved submission to: {sub_path}")
 
-predict_test_and_save_csv()
+# predict_test_and_save_csv()
 
 # %%
 if CFG.kaggle == True:
@@ -607,8 +609,7 @@ if CFG.kaggle == True:
         )
 
 
-# %%
-end_time = time.time()
-execution_time_minutes = (end_time - start_time) / 60
-print(f"Script ended at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
-print(f"Total execution time: {execution_time_minutes:.2f} minutes")
+# %% main
+if __name__ == "__main__":
+    fold_ckpts = run_cv_and_train_full()
+    predict_test_and_save_csv()

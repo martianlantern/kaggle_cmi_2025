@@ -12,7 +12,7 @@ import lightgbm as lgb
 INPUT_DIR = "../kaggle_cmi_2025/data"
 OUTPUT_DIR = "./outputs_lgbm_thm"
 N_FOLDS = 5
-MAX_LEN = 400
+MAX_LEN = 1000
 
 # %% preprocessing utils
 def interpolate_fill_nan_safe(df: pd.DataFrame, cols: Tuple[str, ...]) -> pd.DataFrame:
