@@ -9,6 +9,7 @@ from typing import List, Dict, Tuple
 from tqdm.auto import tqdm
 
 # Paths to test data and demographics
+OUTPUT_DIR = "./outputs"
 TEST_DATA_PATH = "./data/test.csv"
 TEST_DEMOGRAPHICS_PATH = "./data/test_demographics.csv"
 
@@ -29,32 +30,33 @@ class LSTM(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         
-        # LSTM layer with bidirectional support
+        # LSTM layer - input shape: (L, B, C) where L=sequence_length, B=batch_size, C=channels
         self.lstm = nn.LSTM(
             input_size=in_ch,
             hidden_size=hidden_size,
             num_layers=num_layers,
             dropout=dropout if num_layers > 1 else 0,
-            batch_first=False,  # Input shape: (L, B, C)
+            batch_first=False,  # We'll transpose input to (L, B, C)
             bidirectional=True
         )
         
-        # Dropout layer to prevent overfitting
+        # Output layer
         self.dropout = nn.Dropout(dropout)
-        # Linear layer to map LSTM outputs to class predictions
         self.head = nn.Linear(hidden_size * 2, n_classes)  # *2 for bidirectional
-
-    def forward(self, x):
-        # Transpose input to match LSTM expectations: (B, L, C) -> (L, B, C)
-        x = x.transpose(0, 1)
-        # Forward pass through LSTM
-        lstm_out, _ = self.lstm(x)
-        # Use the last output of LSTM (last time step)
-        last_output = lstm_out[-1]
-        # Apply dropout and pass through the linear layer
+        
+    def forward(self, x):  # x: (B, L, C) from DataLoader
+        # Transpose to (L, B, C) for LSTM
+        x = x.transpose(0, 1)  # (B, L, C) -> (L, B, C)
+        
+        # LSTM forward pass
+        lstm_out, _ = self.lstm(x)  # (L, B, hidden_size*2)
+        
+        # Take the last output from LSTM
+        last_output = lstm_out.mean(dim=0) # (B, hidden_size*2)
+        
+        # Apply dropout and classification
         out = self.dropout(last_output)
-        out = self.head(out)
-        return out
+        return self.head(out)
 
 # Function to interpolate and fill NaN values in a DataFrame
 def interpolate_fill_nan_safe(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
@@ -188,9 +190,41 @@ def _get_ensemble():
         in_ch = len(cfg['imu_cols'])
         n_classes = len(_meta['classes'])
         
+        # CRITICAL FIX: Load training data and recreate the exact same LabelEncoder
+        # that 3_LSTM.py uses
+        try:
+            train_data_path = "./data/train.csv"
+            if os.path.exists(train_data_path):
+                print("Loading training data to recreate LabelEncoder...")
+                train_data = pd.read_csv(train_data_path)
+                
+                # Get unique gestures in the order they appear in training data
+                unique_gestures = train_data['gesture'].unique()
+                print(f"Found {len(unique_gestures)} unique gestures in training data")
+                
+                # Create LabelEncoder and fit it on the training data
+                from sklearn.preprocessing import LabelEncoder
+                le = LabelEncoder()
+                le.fit(unique_gestures)
+                
+                # Get the classes in the exact order the LabelEncoder uses
+                correct_class_order = list(le.classes_)
+                print(f"LabelEncoder classes: {correct_class_order}")
+                
+                # Update the metadata with the correct class order
+                _meta['classes'] = correct_class_order
+                print(f"Updated metadata classes to match training data")
+            else:
+                print("Warning: Training data not found at ./data/train.csv")
+                print("Using metadata classes as-is (may cause mismatched predictions)")
+        except Exception as e:
+            print(f"Warning: Could not load training data: {e}")
+            print("Using metadata classes as-is (may cause mismatched predictions)")
+        
         _ENSEMBLE = InferenceEnsemble(ckpt_paths, in_ch, n_classes, device=DEVICE, dropout=0.0)
         print(f"Loaded {len(ckpt_paths)} models for inference")
         print(f"Device: {DEVICE}")
+        print(f"Using class order with {len(_meta['classes'])} classes")
     
     return _ENSEMBLE, _meta
 
@@ -215,7 +249,34 @@ def predict(sequence_df: pl.DataFrame, demographics: pl.DataFrame) -> str:
         # Convert to pandas DataFrame for processing
         seq_df = sequence_df.to_pandas()
         
-        return ensemble.predict_label_for_sequence_df(seq_df)
+        # DEBUG: Let's see what the model actually outputs
+        # First, preprocess the data exactly like 3_LSTM.py does
+        seq_df = interpolate_fill_nan_safe(seq_df, imu_cols)
+        x = seq_df[imu_cols].astype(np.float32).values
+        x = resample_to_fixed_length(x, max_len)
+        x = zscore_per_sequence(x)
+        
+        # DEBUG: Print the preprocessed data shape and values
+        print(f"DEBUG: Preprocessed data shape: {x.shape}")
+        print(f"DEBUG: Data range: [{np.min(x):.4f}, {np.max(x):.4f}]")
+        print(f"DEBUG: Data mean: {np.mean(x):.4f}, std: {np.std(x):.4f}")
+        
+        # Prepare tensor for model input
+        xb = torch.tensor(x[None, ...], dtype=torch.float32, device=ensemble.device)
+        
+        # Get raw model outputs
+        with torch.no_grad():
+            probs = ensemble.predict_proba_batch(xb)[0]
+            pred_idx = int(np.argmax(probs))
+            max_prob = float(np.max(probs))
+        
+        # DEBUG: Print what we're getting
+        print(f"DEBUG: Model predicted index {pred_idx} with probability {max_prob:.4f}")
+        print(f"DEBUG: Available classes: {len(idx_to_class)}")
+        print(f"DEBUG: Class at index {pred_idx}: {idx_to_class[pred_idx]}")
+        
+        # Return the predicted class
+        return idx_to_class[pred_idx]
     
     except Exception as e:
         print(f"Prediction failed with error: {e}. Returning default prediction: 'text on phone'")

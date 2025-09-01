@@ -1,5 +1,5 @@
-# CV meanF1=0.639
-# LB 0.593
+# CV macroF1=0.4893 | binF1=0.9026 | meanF1=0.6756
+# LB 0.639
 
 # %%
 import os
@@ -43,11 +43,11 @@ DEVICE = (
 # %%
 @dataclass
 class Config:
-    max_len: int = 400
+    max_len: int = 800
     batch_size: int = 64
     num_workers: int = 8
     n_folds: int = 5
-    n_epochs: int = 12
+    n_epochs: int = 20
     lr: float = 2e-3
     weight_decay: float = 1e-4
     dropout: float = 0.2
@@ -55,9 +55,10 @@ class Config:
     early_stopping_patience: int = 4
     grad_clip_norm: float = 1.0
     verbose: int = 1
-    # LSTM-specific parameters
-    lstm_hidden_size: int = 128
-    lstm_num_layers: int = 2
+    # LSTM-specific
+    lstm_hidden: int = 256
+    lstm_layers: int = 2
+    lstm_bidirectional: bool = True
 
 CFG = Config()
 
@@ -76,21 +77,17 @@ def interpolate_fill_nan_safe(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame
     impute any still-all-NaN columns to 0. Finally, fill any residual NaNs with per-sequence median, then 0.
     """
     out = df.copy()
-    # Work only on existing cols (defensive)
     cols = [c for c in cols if c in out.columns]
     out[cols] = out[cols].astype(np.float32)
 
-    # Linear interpolation and ffill/bfill
     out[cols] = out[cols].interpolate(method="linear", limit_direction="both", axis=0)
     out[cols] = out[cols].ffill().bfill()
 
-    # Entire column may still be NaN if sensor never reported in this sequence
     still_all_nan = out[cols].isna().all(axis=0)
     if still_all_nan.any():
         for c in out[cols].columns[still_all_nan]:
             out[c] = 0.0
 
-    # Residual sporadic NaNs -> per-sequence median, then 0
     med = out[cols].median(axis=0)
     out[cols] = out[cols].fillna(med).fillna(0.0)
     return out
@@ -101,7 +98,6 @@ def resample_to_fixed_length(arr: np.ndarray, out_len: int) -> np.ndarray:
     if T == out_len:
         return arr
     if T <= 1:
-        # If degenerate length, just repeat or pad zeros
         base = np.zeros((out_len, C), dtype=np.float32)
         if T == 1:
             base[:] = arr[0]
@@ -120,7 +116,6 @@ def zscore_per_sequence(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """
     m = np.nanmean(x, axis=0)
     s = np.nanstd(x, axis=0)
-    # Replace NaN means with 0; replace tiny/NaN std with 1 (so output becomes ~0)
     m = np.where(np.isnan(m), 0.0, m)
     s = np.where(np.isnan(s) | (s < eps), 1.0, s)
     return (x - m) / s
@@ -189,10 +184,9 @@ class SequenceDataset(Dataset):
         x = df[self.imu_cols].astype(np.float32).values  # (T, C)
         x = resample_to_fixed_length(x, self.max_len)
         x = zscore_per_sequence(x)
-        # Keep as (L, C) - this will be batched to (B, L, C) by DataLoader
+        x = x.T  # (C, L)
         return x
 
-    # The sequence_id is a string and we will pass 0's for now
     def __getitem__(self, i: int):
         sid = self.index_rows.loc[i, "sequence_id"]
         x = self._prep_one(sid)
@@ -203,39 +197,51 @@ class SequenceDataset(Dataset):
             return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long), 0
 
 # %%
-class LSTM(nn.Module):
-    def __init__(self, in_ch: int, n_classes: int, hidden_size: int = 128, num_layers: int = 2, dropout: float = 0.2):
+class LSTM1D(nn.Module):
+    """
+    Expects input (B, C, L); internally transposes to (B, L, C) for LSTM.
+    Uses BiLSTM -> temporal mean pooling -> classification head.
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        n_classes: int,
+        hidden: int = 256,
+        num_layers: int = 2,
+        bidirectional: bool = True,
+        dropout: float = 0.2,
+    ):
         super().__init__()
-        self.hidden_size = hidden_size
+        self.in_ch = in_ch
+        self.hidden = hidden
         self.num_layers = num_layers
-        
-        # LSTM layer - input shape: (L, B, C) where L=sequence_length, B=batch_size, C=channels
+        self.bidirectional = bidirectional
+
+        self.input_norm = nn.LayerNorm(in_ch)  # across channels
         self.lstm = nn.LSTM(
             input_size=in_ch,
-            hidden_size=hidden_size,
+            hidden_size=hidden,
             num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0,
-            batch_first=False,  # We'll transpose input to (L, B, C)
-            bidirectional=True
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if num_layers > 1 else 0.0,
         )
-        
-        # Output layer
-        self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(hidden_size * 2, n_classes)  # *2 for bidirectional
-        
-    def forward(self, x):  # x: (B, L, C) from DataLoader
-        # Transpose to (L, B, C) for LSTM
-        x = x.transpose(0, 1)  # (B, L, C) -> (L, B, C)
-        
-        # LSTM forward pass
-        lstm_out, _ = self.lstm(x)  # (L, B, hidden_size*2)
-        
-        # Take the last output from LSTM
-        last_output = lstm_out.mean(dim=0) # (B, hidden_size*2)
-        
-        # Apply dropout and classification
-        out = self.dropout(last_output)
-        return self.head(out)
+        out_dim = hidden * (2 if bidirectional else 1)
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(out_dim, out_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(out_dim // 2, n_classes),
+        )
+
+    def forward(self, x):  # x: (B, C, L)
+        x = x.transpose(1, 2)  # (B, L, C)
+        x = self.input_norm(x)
+        y, _ = self.lstm(x)    # (B, L, H*dir)
+        y = y.mean(dim=1)      # temporal mean pool -> (B, H*dir)
+        logits = self.head(y)  # (B, n_classes)
+        return logits
 
 # %%
 def train_one_epoch(model, loader, optimizer, scheduler, criterion, desc: str):
@@ -257,7 +263,6 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, desc: str):
         loss_sum += loss.item() * bs
         n += bs
         curr = loss_sum / max(1, n)
-        # show running average and last LR on the bar
         try:
             lr = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
         except Exception:
@@ -293,7 +298,15 @@ def run_cv_and_train_full():
     set_seed()
     n_classes = len(le.classes_)
     in_ch = len(CFG.imu_cols)
-
+    
+    # Check if all fold models already exist
+    expected_models = [os.path.join(OUTPUT_DIR, f"lstm1d_fold{fold}.pt") for fold in range(1, CFG.n_folds + 1)]
+    meta_path = os.path.join(OUTPUT_DIR, "meta.json")
+    
+    if all(os.path.exists(p) for p in expected_models) and os.path.exists(meta_path):
+        print("All fold models already exist. Skipping training...")
+        return expected_models
+    
     y = train_seq["gesture_idx"].values
     subjects = train_seq["subject"].astype(str).values
 
@@ -314,20 +327,22 @@ def run_cv_and_train_full():
         tr_loader = DataLoader(tr_ds, batch_size=CFG.batch_size, shuffle=True,  num_workers=CFG.num_workers, pin_memory=True)
         va_loader = DataLoader(va_ds, batch_size=CFG.batch_size, shuffle=False, num_workers=CFG.num_workers, pin_memory=True)
 
-        model = LSTM(
-            in_ch=in_ch, 
-            n_classes=n_classes, 
-            hidden_size=128,  # You can adjust this
-            num_layers=2,     # You can adjust this
+        model = LSTM1D(
+            in_ch=in_ch,
+            n_classes=n_classes,
+            hidden=CFG.lstm_hidden,
+            num_layers=CFG.lstm_layers,
+            bidirectional=CFG.lstm_bidirectional,
             dropout=CFG.dropout
         ).to(DEVICE)
+
         optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
         steps_per_epoch = max(1, len(tr_loader))
         scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=CFG.lr, epochs=CFG.n_epochs, steps_per_epoch=steps_per_epoch)
         criterion = nn.CrossEntropyLoss()
 
         best_score = -1.0
-        best_path = os.path.join(OUTPUT_DIR, f"lstm_fold{fold}.pt")
+        best_path = os.path.join(OUTPUT_DIR, f"lstm1d_fold{fold}.pt")
         patience = CFG.early_stopping_patience
         epochs_no_improve = 0
 
@@ -338,7 +353,6 @@ def run_cv_and_train_full():
             va_desc = f"Fold {fold} | Epoch {epoch}/{CFG.n_epochs} | valid"
             va_loss, sids, preds, probs = validate_epoch(model, va_loader, criterion, va_desc)
 
-            # Metrics
             y_true = va_rows["gesture_idx"].values
             metrics = competition_metric(y_true, preds, idx_to_class, gesture_to_type)
 
@@ -348,7 +362,6 @@ def run_cv_and_train_full():
                 f"| macroF1 {metrics['macro_f1']:.4f} | binF1 {metrics['binary_f1']:.4f} | meanF1 {metrics['mean_f1']:.4f}"
             )
 
-            # Track best by meanF1
             if metrics["mean_f1"] > best_score:
                 best_score = metrics["mean_f1"]
                 torch.save(model.state_dict(), best_path)
@@ -359,16 +372,13 @@ def run_cv_and_train_full():
                     tqdm.write(f"  Early stopping on fold {fold} at epoch {epoch}")
                     break
 
-        # Load best & produce OOF for this fold
         model.load_state_dict(torch.load(best_path, map_location=DEVICE))
         va_loader_eval = DataLoader(va_ds, batch_size=CFG.batch_size, shuffle=False, num_workers=CFG.num_workers)
         _, sids, preds, probs = validate_epoch(model, va_loader_eval, criterion, f"Fold {fold} | OOF")
-        # Map into oof arrays
         oof_pred[va_idx] = preds
         oof_prob[va_idx] = probs
         fold_ckpts.append(best_path)
 
-    # CV metrics
     metrics = competition_metric(
         train_seq["gesture_idx"].values,
         oof_pred,
@@ -377,7 +387,6 @@ def run_cv_and_train_full():
     )
     print(f"\nCV macroF1={metrics['macro_f1']:.4f} | binF1={metrics['binary_f1']:.4f} | meanF1={metrics['mean_f1']:.4f}")
 
-    # Save meta for inference
     meta = {
         "cfg": asdict(CFG),
         "fold_ckpts": fold_ckpts,
@@ -394,11 +403,18 @@ fold_ckpts = run_cv_and_train_full()
 
 # %%
 class InferenceEnsemble:
-    def __init__(self, ckpt_paths: List[str], in_ch: int, n_classes: int, device=DEVICE, dropout=0.0):
+    def __init__(self, ckpt_paths: List[str], in_ch: int, n_classes: int, device=DEVICE, dropout: float = 0.0):
         self.device = device
         self.models = []
         for p in ckpt_paths:
-            m = LSTM(in_ch, n_classes, hidden_size=128, num_layers=2, dropout=dropout).to(device)
+            m = LSTM1D(
+                in_ch=in_ch,
+                n_classes=n_classes,
+                hidden=CFG.lstm_hidden,
+                num_layers=CFG.lstm_layers,
+                bidirectional=CFG.lstm_bidirectional,
+                dropout=CFG.dropout
+            ).to(device)
             m.load_state_dict(torch.load(p, map_location=device))
             m.eval()
             self.models.append(m)
@@ -412,11 +428,10 @@ class InferenceEnsemble:
         return np.mean(probs, axis=0)
 
     def predict_label_for_sequence_df(self, seq_df: pd.DataFrame) -> str:
-        # Prepare single sequence -> (1,C,L)
         seq_df = interpolate_fill_nan_safe(seq_df, list(CFG.imu_cols))
         x = seq_df[list(CFG.imu_cols)].astype(np.float32).values
         x = resample_to_fixed_length(x, CFG.max_len)
-        x = zscore_per_sequence(x)
+        x = zscore_per_sequence(x).T
         xb = torch.tensor(x[None, ...], dtype=torch.float32, device=self.device)
         probs = self.predict_proba_batch(xb)[0]
         pred_idx = int(np.argmax(probs))
@@ -463,12 +478,16 @@ def predict(sequence_df: pl.DataFrame, demographics: pl.DataFrame) -> str:
     Input: DataFrame with at least IMU columns (acc_*, rot_* if available).
     Returns: gesture label as string.
     """
-    # Ensure missing IMU columns are present for pipeline consistency
+    # Convert Polars to Pandas DataFrame
+    sequence_df_pd = sequence_df.to_pandas()
+    
     for c in CFG.imu_cols:
-        if c not in sequence_df.columns:
-            sequence_df[c] = np.nan
+        if c not in sequence_df_pd.columns:
+            sequence_df_pd[c] = np.nan
     ens = _get_ensemble()
-    return ens.predict_label_for_sequence_df(sequence_df)
+    prediction = ens.predict_label_for_sequence_df(sequence_df_pd) 
+    print(f"Prediction: {prediction}")
+    return prediction
 
 inference_server = kaggle_evaluation.cmi_inference_server.CMIInferenceServer(predict)
 
@@ -477,7 +496,7 @@ if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
 else:
     inference_server.run_local_gateway(
         data_paths=(
-            '/kaggle/input/cmi-detect-behavior-with-sensor-data/test.csv',
-            '/kaggle/input/cmi-detect-behavior-with-sensor-data/test_demographics.csv',
+            "./data/test.csv",
+            "./data/test_demographics.csv",
         )
     )
