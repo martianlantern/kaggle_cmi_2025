@@ -52,7 +52,7 @@ class Config:
     max_len: int = 400
     batch_size: int = 32
     num_workers: int = 8
-    n_folds: int = 3
+    n_folds: int = 2
     n_epochs: int = 12
     lr: float = 2e-3
     weight_decay: float = 1e-4

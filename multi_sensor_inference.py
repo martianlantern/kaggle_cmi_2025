@@ -3,19 +3,21 @@ import json
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+import torch.nn as nn
+from tqdm import tqdm
 
 # -----------------------
 # CONFIGURATION
 # -----------------------
-OUTPUT_DIR = "./multi_data_output"  # Where checkpoints and meta.json are saved
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+INPUT_DIR = "/kaggle/input/cmi-detect-behavior-with-sensor-data"
+OUTPUT_DIR = "/kaggle/working"
+
+TEST_DATA_PATH = os.path.join(INPUT_DIR, "test.csv")
 
 # -----------------------
 # MODEL DEFINITION
 # -----------------------
-import torch.nn as nn
-
 class CNN1D(nn.Module):
     def __init__(self, in_ch: int, n_classes: int, dropout: float = 0.2):
         super().__init__()
@@ -41,7 +43,7 @@ class CNN1D(nn.Module):
         return self.head(x)
 
 # -----------------------
-# INFERENCE ENSEMBLE
+# ENSEMBLE
 # -----------------------
 class InferenceEnsemble:
     def __init__(self, ckpt_paths, in_ch, n_classes, device=DEVICE, dropout=0.0):
@@ -54,20 +56,17 @@ class InferenceEnsemble:
             self.models.append(m)
 
     @torch.no_grad()
-    def predict_proba_batch(self, xb: torch.Tensor) -> np.ndarray:
+    def predict_label_for_sequence(self, x: np.ndarray) -> int:
+        xb = torch.tensor(x[None, ...], dtype=torch.float32, device=self.device)
         probs = []
         for m in self.models:
             logits = m(xb)
             probs.append(torch.softmax(logits, dim=1).cpu().numpy())
-        return np.mean(probs, axis=0)
-
-    def predict_label_for_sequence(self, x: np.ndarray) -> int:
-        xb = torch.tensor(x[None, ...], dtype=torch.float32, device=self.device)
-        probs = self.predict_proba_batch(xb)[0]
+        probs = np.mean(probs, axis=0)
         return int(np.argmax(probs))
 
 # -----------------------
-# FEATURE PREPROCESSING
+# FEATURE PIPELINE
 # -----------------------
 def interpolate_fill_nan_safe(df, cols):
     df = df.copy()
@@ -100,7 +99,7 @@ def prepare_sequence_features(seq_df, imu_cols, thm_cols=None, tof_sensors=5, to
     x_imu = resample_to_fixed_length(x_imu, max_len)
     x_imu = zscore_per_sequence(x_imu).T
     all_features = [x_imu]
-    
+
     if use_all_sensors:
         # Thermopile
         if thm_cols:
@@ -113,7 +112,7 @@ def prepare_sequence_features(seq_df, imu_cols, thm_cols=None, tof_sensors=5, to
             else:
                 x_thm = np.zeros((len(thm_cols), max_len), dtype=np.float32)
             all_features.append(x_thm)
-        
+
         # ToF
         tof_features = []
         for sensor_id in range(1, tof_sensors + 1):
@@ -129,15 +128,14 @@ def prepare_sequence_features(seq_df, imu_cols, thm_cols=None, tof_sensors=5, to
                 tof_features.append(np.zeros(max_len, dtype=np.float32))
         if tof_features:
             all_features.append(np.stack(tof_features))
-    
-    x = np.concatenate(all_features, axis=0)
-    return x
+
+    return np.concatenate(all_features, axis=0)
 
 # -----------------------
-# LOAD META AND ENSEMBLE
+# LOAD META + ENSEMBLE
 # -----------------------
-meta = json.load(open(os.path.join(OUTPUT_DIR, "meta.json")))
-ckpts = meta["fold_ckpts"]
+meta = json.load(open(os.path.join(INPUT_DIR, "meta.json")))
+ckpts = [os.path.join(INPUT_DIR, os.path.basename(p)) for p in meta["fold_ckpts"]]
 imu_cols = meta["cfg"]["imu_cols"]
 thm_cols = meta["cfg"]["thm_cols"]
 tof_sensors = meta["cfg"]["tof_sensors"]
@@ -150,18 +148,82 @@ in_ch = len(imu_cols) + len(thm_cols) + tof_sensors if use_all_sensors else len(
 ensemble = InferenceEnsemble(ckpts, in_ch, len(idx_to_class), device=DEVICE)
 
 # -----------------------
-# PREDICT ON TEST DATA
+# PREDICT FUNCTION (used by server + test)
 # -----------------------
-test_data = pd.read_csv(os.path.join("./kaggle_cmi_2025/data", "test.csv"))
-test_seq_ids = test_data["sequence_id"].unique()
-preds = []
-
-for seq_id in test_seq_ids:
-    seq_df = test_data[test_data["sequence_id"] == seq_id].sort_values("sequence_counter")
+def predict(seq_df: pd.DataFrame) -> str:
+    """Predict gesture for a single sequence"""
     x = prepare_sequence_features(seq_df, imu_cols, thm_cols, tof_sensors, tof_pixels, max_len, use_all_sensors)
-    pred_label = idx_to_class[ensemble.predict_label_for_sequence(x)]
-    preds.append({"sequence_id": seq_id, "gesture": pred_label})
+    pred_idx = ensemble.predict_label_for_sequence(x)
+    return idx_to_class[pred_idx]
 
-submission = pd.DataFrame(preds)
-submission.to_csv(os.path.join(OUTPUT_DIR, "submission.csv"), index=False)
-print(f"Saved submission to: {os.path.join(OUTPUT_DIR, 'submission.csv')}")
+# -----------------------
+# TEST INFERENCE PIPELINE
+# -----------------------
+def test_inference():
+    """Test inference pipeline with actual test data"""
+    print("Testing inference pipeline...")
+
+    try:
+        test_data = pd.read_csv(TEST_DATA_PATH)
+        print(f"Loaded test data: {len(test_data)} rows")
+    except FileNotFoundError as e:
+        print(f"Error loading test data: {e}")
+        return
+
+    seq_ids = test_data['sequence_id'].unique()
+    print(f"Found {len(seq_ids)} unique sequences")
+
+    test_sequences = seq_ids[:5]
+    predictions = []
+
+    for seq_id in tqdm(test_sequences, desc="Testing inference"):
+        seq_data = test_data[test_data["sequence_id"] == seq_id].sort_values("sequence_counter")
+        try:
+            pred = predict(seq_data)
+            predictions.append({
+                "sequence_id": seq_id,
+                "predicted_gesture": pred,
+                "sequence_length": len(seq_data)
+            })
+            print(f"Sequence {seq_id}: Predicted '{pred}' (len={len(seq_data)})")
+        except Exception as e:
+            print(f"Error predicting sequence {seq_id}: {e}")
+            predictions.append({
+                "sequence_id": seq_id,
+                "predicted_gesture": "ERROR",
+                "sequence_length": len(seq_data)
+            })
+
+    print("\n" + "="*50)
+    print("INFERENCE TEST SUMMARY")
+    print("="*50)
+    print(f"Tested {len(predictions)} sequences")
+    successes = [p for p in predictions if p["predicted_gesture"] != "ERROR"]
+    print(f"Successful predictions: {len(successes)}")
+    print(f"Failed predictions: {len(predictions) - len(successes)}")
+
+    return predictions
+
+# -----------------------
+# SERVER HOOK
+# -----------------------
+import kaggle_evaluation.cmi_inference_server as cmi
+
+if __name__ == "__main__":
+    # Run quick test
+    test_inference()
+
+    print("\n" + "="*50)
+    print("SETTING UP INFERENCE SERVER")
+    print("="*50)
+
+    inference_server = cmi.CMIInferenceServer(predict)
+
+    if os.getenv("KAGGLE_IS_COMPETITION_RERUN"):
+        print("Running in competition mode - serving inference server...")
+        inference_server.serve()
+    else:
+        print("Running in local mode - starting local gateway...")
+        inference_server.run_local_gateway(
+            data_paths=(TEST_DATA_PATH,)
+        )

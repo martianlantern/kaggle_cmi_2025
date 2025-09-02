@@ -30,8 +30,8 @@ from scipy.spatial.transform import Rotation as R
 @dataclass
 class Config:
     max_len: int = 400
-    batch_size: int = 32
-    num_workers: int = 8
+    batch_size: int = 16
+    num_workers: int = 4
     n_folds: int = 3
     n_epochs: int = 12
     lr: float = 2e-3

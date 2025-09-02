@@ -5,6 +5,8 @@ __pycache__/
 data
 
 /notebooks/notebook1_result
+/gesture_pred
+
 # C extensions
 *.so
 
